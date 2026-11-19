@@ -11,6 +11,7 @@ Status convention (không dùng True/False mơ hồ):
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -42,8 +43,51 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # Regex is one signal, not the whole security boundary.
 # ============================================================
 
+def _normalize(text: str) -> str:
+    """Canonicalize text so obfuscated input matches the same patterns.
+
+    NFKC folds full-width / compatibility chars, then every format character
+    (category Cf: zero-width space/joiner, BOM, bidi controls) is dropped and
+    whitespace is collapsed, so "Ignore<ZWSP>  all" becomes "ignore all".
+    """
+    text = unicodedata.normalize("NFKC", text or "")
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Cf")
+    return re.sub(r"\s+", " ", text).casefold().strip()
+
+
+def _strip_accents(text: str) -> str:
+    """Remove Vietnamese diacritics so 'tài khoản' matches 'tai khoan'."""
+    text = unicodedata.normalize("NFD", text).replace("đ", "d").replace("Đ", "D")
+    return "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+
+
+INJECTION_PATTERNS = [
+    r"ignore\s+(all\s+|any\s+|the\s+)?(previous|prior|above|earlier|your)\s+(instructions?|rules?|prompts?|directions?)",
+    r"(disregard|forget|override|bypass)\s+(all\s+|any\s+|the\s+|your\s+)?(previous\s+|prior\s+|above\s+|earlier\s+|safety\s+|security\s+)?(instructions?|rules?|guidelines?|restrictions?|guardrails?)",
+    r"\byou are now\b",
+    r"\bsystem\s*prompt\b",
+    r"reveal\s+(your|the)\s+(instructions?|prompt|rules|configuration)",
+    r"(show|print|repeat|output|display|tell me)\s+(me\s+)?(your|the)\s+(initial\s+|original\s+)?(instructions?|prompt)",
+    r"pretend\s+(that\s+)?(you\s+are|to\s+be|you're)",
+    r"act\s+as\s+(a\s+|an\s+)?(unrestricted|unfiltered|jailbroken|dan\b)",
+    r"\b(dan|developer|god)\s+mode\b",
+    r"\bjailbreak",
+    r"(admin|administrator|internal|system|root|database|db)\s+(password|credentials?|api[\s_-]?key|secret)",
+    r"your\s+(password|credentials?|api[\s_-]?key|secret)",
+    r"\bsk-[a-z0-9-]{6,}",
+    # Vietnamese (matched on the accent-stripped form)
+    r"bo\s+qua\s+(tat\s+ca\s+)?(cac\s+)?(huong\s+dan|chi\s+dan|quy\s+tac)",
+    r"(tiet\s+lo|cho\s+(toi\s+)?xem)\s+(system\s+prompt|mat\s+khau|khoa\s+api)",
+]
+_INJECTION_RES = [re.compile(p) for p in INJECTION_PATTERNS]
+
+
 def detect_injection(user_input: str) -> InputStatus:
     """Detect prompt injection patterns in user input.
+
+    Works on the normalized text (and its accent-stripped form), so zero-width
+    characters or Vietnamese diacritics cannot be used to dodge a pattern.
+    Merely mentioning an external email / document is NOT a signal by itself.
 
     Args:
         user_input: The user's message
@@ -51,14 +95,10 @@ def detect_injection(user_input: str) -> InputStatus:
     Returns:
         ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
-    ]
-
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    normalized = _normalize(user_input)
+    candidates = (normalized, _strip_accents(normalized))
+    for regex in _INJECTION_RES:
+        if any(regex.search(c) for c in candidates):
             return "BLOCK"
     return "ALLOW"
 
@@ -84,14 +124,18 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    input_lower = _strip_accents(_normalize(user_input))
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    def _hit(topic: str) -> bool:
+        # Leading word boundary only: "loans"/"credits" still match, but
+        # "skill" does not trip "kill" and "treatment" does not trip "atm".
+        return re.search(r"\b" + re.escape(topic), input_lower) is not None
 
-    pass  # Replace with your implementation
+    if any(_hit(t) for t in BLOCKED_TOPICS):
+        return "BLOCK"
+    if not any(_hit(t) for t in ALLOWED_TOPICS):
+        return "BLOCK"
+    return "ALLOW"
 
 
 # ============================================================
@@ -144,14 +188,23 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Your request looks like an attempt to override my instructions "
+                "or access internal information, so I can't help with it. "
+                "I can answer questions about VinBank accounts, transfers, "
+                "loans, savings and cards."
+            )
 
-        pass  # Replace with your implementation
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "I can only help with VinBank banking topics such as accounts, "
+                "transactions, loans, interest rates, savings and credit cards."
+            )
+
+        return None
 
 
 # ============================================================

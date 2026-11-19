@@ -41,17 +41,51 @@ class MonitoringAlert:
     judge_checks: int = 0
     judge_fails: int = 0
 
+    def record(self, *, blocked: bool, layer: str | None = None, judge_checked: bool = False, judge_failed: bool = False):
+        """Update counters for one finished request (call from the pipeline)."""
+        self.total_requests += 1
+        if blocked:
+            self.blocked_requests += 1
+        if layer == "rate_limiter":
+            self.rate_limit_hits += 1
+        if judge_checked:
+            self.judge_checks += 1
+            if judge_failed:
+                self.judge_fails += 1
+
     def check_metrics(self) -> list[Alert]:
-        """TODO: compute rates, append Alert objects when thresholds exceeded."""
-        raise NotImplementedError("Implement MonitoringAlert.check_metrics")
+        """Recompute rates and (re)build the alert list from current counters."""
+        self.alerts = []
+        snap = self.snapshot()
+        if snap["block_rate"] > self.block_rate_threshold:
+            self.alerts.append(Alert(
+                "block_rate", snap["block_rate"], self.block_rate_threshold,
+                f"Block rate {snap['block_rate']:.0%} is above "
+                f"{self.block_rate_threshold:.0%}: possible attack wave or over-blocking.",
+            ))
+        if self.rate_limit_hits >= self.rate_limit_hit_threshold:
+            self.alerts.append(Alert(
+                "rate_limit_hits", float(self.rate_limit_hits),
+                float(self.rate_limit_hit_threshold),
+                f"{self.rate_limit_hits} rate-limit hits: a client is flooding the API.",
+            ))
+        if snap["judge_fail_rate"] > self.judge_fail_rate_threshold:
+            self.alerts.append(Alert(
+                "judge_fail_rate", snap["judge_fail_rate"],
+                self.judge_fail_rate_threshold,
+                "LLM judge is flagging many responses as unsafe.",
+            ))
+        return self.alerts
 
     def export_json(self, filepath: str | None = None):
-        """TODO: write metrics + alerts to JSON under repo-root ``outputs/`` by default.
-        Use ``filepath or default_metrics_path()`` so running from ``src/`` does not
-        create ``src/outputs/``.
-        """
-        _ = filepath or default_metrics_path()
-        raise NotImplementedError("Implement MonitoringAlert.export_json")
+        """Write metrics + alerts under repo-root ``outputs/`` by default."""
+        self.check_metrics()
+        path = Path(filepath or default_metrics_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(self.snapshot(), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return str(path)
 
     def snapshot(self) -> dict:
         block_rate = (
